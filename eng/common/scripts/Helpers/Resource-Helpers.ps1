@@ -19,18 +19,33 @@ function Get-PurgeableGroupResources {
 }
 
 function Get-PurgeableResources {
+    $purgeableResources = @()
     $subscriptionId = (Get-AzContext).Subscription.Id
 
+    Write-Verbose "Retrieving the purgeable resources from subscription $subscriptionId"
+
+    Write-Verbose "Retrieving deleted Key Vaults from subscription $subscriptionId"
+
     # Get deleted Key Vaults for the current subscription.
-    Get-AzKeyVault -InRemovedState `
+    $deletedKeyVaults  = Get-AzKeyVault -InRemovedState `
         | Add-Member -MemberType NoteProperty -Name AzsdkResourceType -Value 'Key Vault' -PassThru
+
+    Write-Verbose "Found $($deletedKeyVaults.Count) deleted Key Vaults to potentiall purge."
+
+    if ($deletedKeyVaults) {
+        $purgeableResources += $deletedKeyVaults
+    }
+
+    Write-Verbose "Retrieving deleted Managed HSM Key Vaults from subscription $subscriptionId"
 
     # Get deleted Managed HSMs for the current subscription.
     $response = Invoke-AzRestMethod -Method GET -Path "/subscriptions/$subscriptionId/providers/Microsoft.KeyVault/deletedManagedHSMs?api-version=2021-04-01-preview" -ErrorAction Ignore
     if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300 -and $response.Content) {
         $content = $response.Content | ConvertFrom-Json
+
+        $deletedHsms = @()
         foreach ($r in $content.value) {
-            [pscustomobject] @{
+            $deletedHsms += [pscustomobject] @{
                 AzsdkResourceType = 'Managed HSM'
                 Id = $r.id
                 Name = $r.name
@@ -40,7 +55,14 @@ function Get-PurgeableResources {
                 EnablePurgeProtection = $r.properties.purgeProtectionEnabled
             }
         }
+        Write-Verbose "Found $($deletedHsms.Count) deleted Managed HSM Key Vaults to potentially purge."
+        $purgeableResources += $deletedHsms
     }
+    else {
+        Write-Verbose "Found no deleted HSMs to purge."
+    }
+
+    return $purgeableResources
 }
 
 # A filter differs from a function by teating body as -process {} instead of -end {}.
@@ -65,7 +87,7 @@ filter Remove-PurgeableResources {
                     # We will try anyway but will ignore errors
                     Write-Warning "Key Vault '$($r.VaultName)' has purge protection enabled and may not be purged for $($r.SoftDeleteRetentionInDays) days"
                 }
-            
+
                 Remove-AzKeyVault -VaultName $r.VaultName -Location $r.Location -InRemovedState -Force -ErrorAction Continue
             }
 
@@ -75,7 +97,7 @@ filter Remove-PurgeableResources {
                     # We will try anyway but will ignore errors
                     Write-Warning "Managed HSM '$($r.Name)' has purge protection enabled and may not be purged for $($r.SoftDeleteRetentionInDays) days"
                 }
-            
+
                 $response = Invoke-AzRestMethod -Method POST -Path "/subscriptions/$subscriptionId/providers/Microsoft.KeyVault/locations/$($r.Location)/deletedManagedHSMs/$($r.Name)/purge?api-version=2021-04-01-preview" -ErrorAction Ignore
                 if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
                     Write-Warning "Successfully requested that Managed HSM '$($r.Name)' be purged, but may take a few minutes before it is actually purged."
